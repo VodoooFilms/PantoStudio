@@ -68,6 +68,8 @@
   window.pantoUpscale = {
     selectVideo: () => invoke('select_upscale_video'),
     inspectVideo: (path) => invoke('inspect_upscale_video', { path }),
+    selectVideos: () => invoke('select_upscale_videos'),
+    inspectVideos: (paths) => invoke('inspect_upscale_videos', { paths }),
     chooseFolder: () => invoke('choose_upscale_folder'),
     computePlan: (args) => invoke('compute_upscale_plan', args),
     start: (request) => invoke('start_upscale', { request }),

@@ -4,9 +4,15 @@
 (function () {
   const COPY = {
     es: {
-      selectAria: 'Seleccionar un vídeo',
-      dropTitle: 'Arrastra un vídeo',
+      selectAria: 'Seleccionar vídeos',
+      dropTitle: 'Arrastra vídeos',
       dropHint: 'o haz clic para abrir',
+      scaleBatch: (count, label) => `Escalar ${count} vídeos a ${label}`,
+      queue: 'Cola',
+      queueCount: (done, total) => `${done}/${total} listos`,
+      fileStates: { pending: 'En espera', processing: 'Escalando…', done: 'Listo', error: 'Error' },
+      removeFile: 'Quitar de la cola',
+      batchFailed: (count) => `${count} con error`,
       input: 'Entrada',
       output: 'Salida',
       noFile: 'Sin archivo',
@@ -54,9 +60,15 @@
       sdFailed: 'El motor de IA falló.'
     },
     en: {
-      selectAria: 'Select a video',
-      dropTitle: 'Drop a video',
+      selectAria: 'Select videos',
+      dropTitle: 'Drop videos',
       dropHint: 'or click to browse',
+      scaleBatch: (count, label) => `Upscale ${count} videos to ${label}`,
+      queue: 'Queue',
+      queueCount: (done, total) => `${done}/${total} done`,
+      fileStates: { pending: 'Pending', processing: 'Upscaling…', done: 'Done', error: 'Error' },
+      removeFile: 'Remove from queue',
+      batchFailed: (count) => `${count} failed`,
       formats: 'MP4 · MOV · MKV · WEBM · AVI',
       input: 'Input',
       output: 'Output',
@@ -138,10 +150,15 @@
   const statusRight = $('upStatusRight');
   const progressTrack = $('upProgressTrack');
   const progressBar = $('upProgressBar');
+  const queuePanel = $('upQueue');
+  const queueList = $('upQueueList');
+  const queueCount = $('upQueueCount');
 
   const state = {
     language: 'es',
     file: null,
+    files: [],
+    fileStatus: {},
     plan: null,
     target: '1080',
     mode: 'crop',
@@ -150,11 +167,31 @@
     loading: false,
     cancelRequested: false,
     result: null,
+    results: [],
+    activeIndex: 0,
+    finishedCount: 0,
     planRequest: 0,
     ffmpegAvailable: true,
     engine: 'lanczos',
     models: []
   };
+
+  function pendingFiles() {
+    return state.files.filter((file) => state.fileStatus[file.path] !== 'done');
+  }
+
+  function doneCount() {
+    return state.files.filter((file) => state.fileStatus[file.path] === 'done').length;
+  }
+
+  function clearResults() {
+    state.result = null;
+    state.results = [];
+    state.finishedCount = 0;
+    state.activeIndex = 0;
+    for (const file of state.files) state.fileStatus[file.path] = 'pending';
+    tab.classList.remove('is-complete');
+  }
 
   function formatEta(seconds) {
     const total = Math.max(0, Math.round(seconds));
@@ -174,12 +211,16 @@
     return base * Math.max(0.5, Math.min(pixels, 20));
   }
 
-  function aiEtaSeconds() {
-    if (!state.file) return 0;
-    const fps = state.file.fps > 0 ? state.file.fps : 30;
-    const frames = Math.max(1, Math.round(state.file.duration * fps));
+  function aiEtaSecondsFor(file) {
+    if (!file) return 0;
+    const fps = file.fps > 0 ? file.fps : 30;
+    const frames = Math.max(1, Math.round(file.duration * fps));
     const factor = state.engine === 'esr-x4' ? 4 : 2;
-    return frames * aiSecondsPerFrame(state.file.width, state.file.height, factor);
+    return frames * aiSecondsPerFrame(file.width, file.height, factor);
+  }
+
+  function aiEtaSeconds() {
+    return pendingFiles().reduce((total, file) => total + aiEtaSecondsFor(file), 0);
   }
 
   function isAi() {
@@ -252,12 +293,29 @@
     statusPanel.className = 'status processing';
     statusIcon.textContent = '';
     statusTitle.textContent = isAi() ? t('scalingAi') : t('scaling');
-    statusDetail.textContent = isAi()
+    const detail = isAi()
       ? t('scalingAiDetail')
       : state.plan ? `${state.plan.label} · ${t('scalingDetail')}` : t('scalingDetail');
+    const active = state.files[state.activeIndex];
+    statusDetail.textContent = state.files.length > 1 && active
+      ? `${state.activeIndex + 1}/${state.files.length} · ${active.name} · ${detail}`
+      : detail;
     statusRight.textContent = `${Math.round(percent)}%`;
     progressTrack.classList.remove('hidden');
     progressBar.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+  }
+
+  function setStatusBatchSuccess(failedCount) {
+    const results = state.results;
+    const last = results[results.length - 1];
+    statusPanel.className = 'status success';
+    statusIcon.textContent = '✓';
+    statusTitle.textContent = t('done');
+    const totalBytes = results.reduce((total, result) => total + result.outputBytes, 0);
+    statusDetail.textContent = `${t('queueCount')(doneCount(), state.files.length)} · ${formatBytes(totalBytes)}`
+      + (failedCount ? ` · ${t('batchFailed')(failedCount)}` : '');
+    statusRight.textContent = last ? sizeDelta(last) : '';
+    progressTrack.classList.add('hidden');
   }
 
   function setStatusSuccess(result) {
@@ -293,7 +351,9 @@
       if (hasThumb) inputThumb.src = file.thumbnail;
       else inputThumb.removeAttribute('src');
 
-      $('upInputName').textContent = file.name;
+      $('upInputName').textContent = state.files.length > 1
+        ? `${file.name}  +${state.files.length - 1}`
+        : file.name;
       $('upInputDimensions').textContent = file.width ? `${file.width} × ${file.height}` : '—';
       inputBadge.textContent = `${file.width} × ${file.height}`;
     } else {
@@ -302,6 +362,47 @@
       $('upInputDimensions').textContent = '—';
       inputBadge.textContent = '';
     }
+  }
+
+  function renderQueue() {
+    const show = state.files.length > 1;
+    queuePanel.classList.toggle('hidden', !show);
+    if (!show) return;
+    $('upQueueTitle').textContent = t('queue');
+    queueCount.textContent = t('queueCount')(doneCount(), state.files.length);
+    queueList.textContent = '';
+    state.files.forEach((file, index) => {
+      const status = state.fileStatus[file.path] || 'pending';
+      const row = document.createElement('div');
+      row.className = `up-queue-row${state.converting && index === state.activeIndex ? ' is-active' : ''}`;
+
+      const name = document.createElement('span');
+      name.className = 'up-queue-name';
+      name.textContent = file.name;
+      name.title = file.path;
+
+      const dims = document.createElement('span');
+      dims.className = 'up-queue-dims';
+      dims.textContent = file.width ? `${file.width} × ${file.height}` : '—';
+
+      const stateLabel = document.createElement('span');
+      stateLabel.className = `up-queue-state ${status}`;
+      stateLabel.textContent = t('fileStates')[status] || status;
+
+      const remove = document.createElement('button');
+      remove.className = 'up-queue-remove';
+      remove.textContent = '×';
+      remove.title = t('removeFile');
+      remove.setAttribute('aria-label', `${t('removeFile')}: ${file.name}`);
+      remove.disabled = state.converting;
+      remove.addEventListener('click', (event) => {
+        event.stopPropagation();
+        removeQueuedFile(file.path);
+      });
+
+      row.append(name, dims, stateLabel, remove);
+      queueList.append(row);
+    });
   }
 
   function renderOutput() {
@@ -314,7 +415,9 @@
       outputBadge.classList.remove('hidden');
       outputThumb.src = result.thumbnail || (state.file && state.file.thumbnail) || '';
       outputBadge.textContent = `${result.plan.targetWidth} × ${result.plan.targetHeight}`;
-      $('upOutputName').textContent = result.outputName;
+      $('upOutputName').textContent = state.results.length > 1
+        ? `${result.outputName}  +${state.results.length - 1}`
+        : result.outputName;
       $('upOutputDimensions').textContent = `${result.plan.targetWidth} × ${result.plan.targetHeight}`;
       return;
     }
@@ -343,7 +446,8 @@
   }
 
   function renderActions() {
-    const showConvert = !state.converting && !state.result;
+    const pending = pendingFiles().length;
+    const showConvert = !state.converting && pending > 0;
     const showCancel = state.converting;
     const showResult = !state.converting && Boolean(state.result);
 
@@ -353,7 +457,8 @@
     revealButton.classList.toggle('hidden', !showResult);
 
     convertButton.disabled = !state.file || state.loading || !state.ffmpegAvailable || !engineReady();
-    convertButton.textContent = t('scaleTo')((state.plan && state.plan.label) || targetInfo().label);
+    const label = (state.plan && state.plan.label) || targetInfo().label;
+    convertButton.textContent = pending > 1 ? t('scaleBatch')(pending, label) : t('scaleTo')(label);
     cancelButton.textContent = t('cancel');
     anotherButton.textContent = t('another');
     revealButton.textContent = t('reveal');
@@ -409,13 +514,52 @@
     }
   }
 
-  function setFile(file) {
-    state.file = file;
-    state.result = null;
+  function setFiles(files, append = false) {
+    const incoming = (files || []).filter(Boolean);
+    if (!incoming.length) return;
+    if (append && state.files.length && !state.result) {
+      const known = new Set(state.files.map((file) => file.path));
+      for (const file of incoming) {
+        if (!known.has(file.path)) {
+          state.files.push(file);
+          state.fileStatus[file.path] = 'pending';
+        }
+      }
+    } else {
+      state.files = incoming;
+      state.fileStatus = {};
+      for (const file of incoming) state.fileStatus[file.path] = 'pending';
+      clearResults();
+    }
+    state.file = state.files[0] || null;
     state.loading = false;
     state.cancelRequested = false;
     tab.classList.remove('is-processing', 'is-complete');
     renderInput();
+    renderQueue();
+    renderOutput();
+    renderActions();
+    refreshPlan();
+  }
+
+  function setFile(file) {
+    setFiles([file]);
+  }
+
+  function removeQueuedFile(path) {
+    if (state.converting) return;
+    state.files = state.files.filter((file) => file.path !== path);
+    delete state.fileStatus[path];
+    state.results = state.results.filter((result) => result.inputPath !== path);
+    if (!state.files.length) {
+      resetFile();
+      return;
+    }
+    if (state.file && state.file.path === path) state.file = state.files[0];
+    if (state.result && !state.results.length) state.result = null;
+    else if (state.results.length) state.result = state.results[state.results.length - 1];
+    renderInput();
+    renderQueue();
     renderOutput();
     renderActions();
     refreshPlan();
@@ -424,12 +568,18 @@
   function resetFile() {
     if (state.converting) return;
     state.file = null;
+    state.files = [];
+    state.fileStatus = {};
     state.plan = null;
     state.result = null;
+    state.results = [];
+    state.finishedCount = 0;
+    state.activeIndex = 0;
     state.loading = false;
     state.planRequest += 1;
     tab.classList.remove('is-processing', 'is-complete');
     renderInput();
+    renderQueue();
     renderOutput();
     renderActions();
     setStatusIdle();
@@ -441,15 +591,15 @@
     renderActions();
     setStatusLoading();
     try {
-      const file = await window.pantoUpscale.selectVideo();
-      if (!file) {
+      const files = await window.pantoUpscale.selectVideos();
+      if (!files || !files.length) {
         state.loading = false;
         renderActions();
         if (state.result) setStatusSuccess(state.result);
         else setStatusIdle();
         return;
       }
-      setFile(file);
+      setFiles(files);
     } catch (error) {
       state.loading = false;
       handleError(error);
@@ -457,14 +607,20 @@
   }
 
   async function handleDrop(paths) {
-    const path = paths && paths[0];
-    if (!path || state.converting) return;
+    if (!paths || !paths.length || state.converting) return;
     state.loading = true;
     renderActions();
     setStatusLoading();
     try {
-      const file = await window.pantoUpscale.inspectVideo(path);
-      setFile(file);
+      const files = await window.pantoUpscale.inspectVideos(paths);
+      state.loading = false;
+      if (!files || !files.length) {
+        handleError(new Error('UNSUPPORTED'));
+        return;
+      }
+      // Drops build the queue: they append to a pending batch (deduped by
+      // path) and replace it once the previous batch is done.
+      setFiles(files, state.files.length > 0 && !state.result);
     } catch (error) {
       state.loading = false;
       handleError(error);
@@ -483,27 +639,31 @@
     }
   }
 
+  function errorMessageFor(error) {
+    const raw = typeof error === 'string' ? error : (error && error.message) || '';
+    if (raw.startsWith('FFMPEG_MISSING')) return t('ffmpegMissing');
+    if (raw.startsWith('MODEL_MISSING')) return t('modelMissingErr');
+    if (raw.startsWith('SD_MISSING')) return t('sdMissing');
+    if (raw.startsWith('SD_FAILED:')) return raw.slice('SD_FAILED:'.length).trim() || t('sdFailed');
+    if (raw.startsWith('UNSUPPORTED')) return t('unsupported');
+    if (raw.startsWith('BUSY')) return t('busy');
+    if (raw.startsWith('FFMPEG_TIMEOUT')) return t('timeout');
+    if (raw.startsWith('FFMPEG_FAILED:')) return raw.slice('FFMPEG_FAILED:'.length).trim() || t('failed');
+    return raw || t('failed');
+  }
+
   function handleError(error) {
     state.loading = false;
     state.converting = false;
     tab.classList.remove('is-processing');
-    const raw = typeof error === 'string' ? error : (error && error.message) || '';
-    let message;
-    if (raw.startsWith('FFMPEG_MISSING')) message = t('ffmpegMissing');
-    else if (raw.startsWith('MODEL_MISSING')) message = t('modelMissingErr');
-    else if (raw.startsWith('SD_MISSING')) message = t('sdMissing');
-    else if (raw.startsWith('SD_FAILED:')) message = raw.slice('SD_FAILED:'.length).trim() || t('sdFailed');
-    else if (raw.startsWith('UNSUPPORTED')) message = t('unsupported');
-    else if (raw.startsWith('BUSY')) message = t('busy');
-    else if (raw.startsWith('FFMPEG_TIMEOUT')) message = t('timeout');
-    else if (raw.startsWith('FFMPEG_FAILED:')) message = raw.slice('FFMPEG_FAILED:'.length).trim() || t('failed');
-    else message = raw || t('failed');
-    setStatusError(message);
+    setStatusError(errorMessageFor(error));
     renderActions();
   }
 
   async function convert() {
     if (!state.file || state.converting || state.loading) return;
+    const queue = pendingFiles();
+    if (!queue.length) return;
 
     if (isAi()) {
       const eta = aiEtaSeconds();
@@ -512,41 +672,77 @@
 
     state.converting = true;
     state.cancelRequested = false;
+    state.finishedCount = doneCount();
     tab.classList.add('is-processing');
     tab.classList.remove('is-complete');
     renderActions();
+    renderQueue();
     setStatusProcessing(0);
 
+    const errors = [];
     try {
-      const result = await window.pantoUpscale.start({
-        inputPath: state.file.path,
-        targetId: state.target,
-        mode: state.mode,
-        outputDirectory: state.outputDirectory,
-        engine: state.engine
-      });
-
-      state.converting = false;
-      state.result = result;
-      tab.classList.remove('is-processing');
-      tab.classList.add('is-complete');
-      renderOutput();
-      setStatusSuccess(result);
-      renderActions();
-      playChime();
-    } catch (error) {
-      const raw = typeof error === 'string' ? error : (error && error.message) || '';
-      state.converting = false;
-      tab.classList.remove('is-processing');
-      if (state.cancelRequested || raw.startsWith('CANCELLED')) {
-        state.result = null;
-        renderOutput();
-        setStatusIdle();
-        renderActions();
-      } else {
-        handleError(error);
+      for (let index = 0; index < state.files.length; index += 1) {
+        if (state.cancelRequested) break;
+        const file = state.files[index];
+        if (state.fileStatus[file.path] === 'done') continue;
+        state.activeIndex = index;
+        state.file = file;
+        state.fileStatus[file.path] = 'processing';
+        renderInput();
+        renderQueue();
+        refreshPlan();
+        try {
+          const result = await window.pantoUpscale.start({
+            inputPath: file.path,
+            targetId: state.target,
+            mode: state.mode,
+            outputDirectory: state.outputDirectory,
+            engine: state.engine
+          });
+          result.inputPath = file.path;
+          state.results.push(result);
+          state.result = result;
+          state.fileStatus[file.path] = 'done';
+        } catch (error) {
+          const raw = typeof error === 'string' ? error : (error && error.message) || '';
+          if (state.cancelRequested || raw.startsWith('CANCELLED')) {
+            state.fileStatus[file.path] = 'pending';
+            break;
+          }
+          state.fileStatus[file.path] = 'error';
+          errors.push(error);
+        }
+        state.finishedCount = state.files.filter(
+          (item) => state.fileStatus[item.path] === 'done' || state.fileStatus[item.path] === 'error'
+        ).length;
+        renderQueue();
       }
+    } finally {
+      state.converting = false;
+      tab.classList.remove('is-processing');
     }
+
+    state.file = state.files[0] || null;
+    renderInput();
+    renderQueue();
+    renderOutput();
+
+    if (state.cancelRequested) {
+      renderOutput();
+      setStatusIdle();
+      renderActions();
+      return;
+    }
+    if (!state.results.length) {
+      handleError(errors[0] || new Error(t('failed')));
+      return;
+    }
+    tab.classList.add('is-complete');
+    if (state.files.length > 1) setStatusBatchSuccess(errors.length);
+    else if (errors.length) setStatusError(errorMessageFor(errors[0]));
+    else setStatusSuccess(state.result);
+    renderActions();
+    playChime();
   }
 
   async function cancel() {
@@ -590,10 +786,10 @@
   function selectTarget(target) {
     if (state.converting || !TARGETS[target] || target === state.target) return;
     state.target = target;
-    state.result = null;
+    clearResults();
     state.planRequest += 1;
-    tab.classList.remove('is-complete');
     renderTargetSelection();
+    renderQueue();
     renderOutput();
     renderActions();
     refreshPlan();
@@ -602,10 +798,10 @@
   function selectMode(mode) {
     if (state.converting || !['pad', 'crop', 'stretch'].includes(mode) || mode === state.mode) return;
     state.mode = mode;
-    state.result = null;
+    clearResults();
     state.planRequest += 1;
-    tab.classList.remove('is-complete');
     renderTargetSelection();
+    renderQueue();
     renderOutput();
     renderActions();
     refreshPlan();
@@ -689,10 +885,10 @@
   function syncEngineFromModels() {
     const active = state.models.find((model) => model.active);
     state.engine = active ? active.id : 'lanczos';
-    state.result = null;
-    tab.classList.remove('is-complete');
+    clearResults();
     renderEngineBadge();
     renderModels();
+    renderQueue();
     renderOutput();
     renderActions();
     if (!state.converting) setStatusIdle();
@@ -744,6 +940,7 @@
     removeButton.title = t('remove');
     renderFolderButton();
     renderInput();
+    renderQueue();
     renderOutput();
     renderTargetSelection();
     renderActions();
@@ -797,13 +994,21 @@
     });
     $('upModelsClose').addEventListener('click', () => setModelsView(false));
     window.pantoUpscale.onProgress(({ percent, elapsed, detail }) => {
-      if (isAi() && typeof percent === 'number' && percent > 5 && percent < 100) {
-        const remaining = Math.max(0, (elapsed * (100 - percent)) / percent);
-        statusDetail.textContent = `${detail ? `${detail} · ` : ''}${t('etaRemaining')} ${formatEta(remaining)}`;
-      }
       if (!state.converting) return;
       const value = Number(percent);
-      if (Number.isFinite(value)) setStatusProcessing(value);
+      if (!Number.isFinite(value)) return;
+      // Per-file progress from the backend → overall queue progress.
+      const total = Math.max(1, state.files.length);
+      const overall = total > 1
+        ? Math.min(100, ((state.finishedCount + value / 100) / total) * 100)
+        : value;
+      setStatusProcessing(overall);
+      if (isAi() && value > 5 && value < 100 && elapsed > 0) {
+        const remaining = Math.max(0, (elapsed * (100 - value)) / value);
+        const prefix = total > 1 ? `${state.activeIndex + 1}/${total} · ` : '';
+        statusDetail.textContent = `${prefix}${detail ? `${detail} · ` : ''}${t('etaRemaining')} ${formatEta(remaining)}`;
+        statusRight.textContent = `${Math.round(overall)}%`;
+      }
     });
   }
 

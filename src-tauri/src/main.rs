@@ -321,6 +321,64 @@ async fn inspect_upscale_video(path: String) -> Result<media::FileDetails, Strin
     .map_err(|e| e.to_string())?
 }
 
+/// Batch variant of `select_upscale_video`: multi-select picker for the
+/// Upscale queue. Unsupported picks are skipped instead of failing all.
+#[tauri::command]
+async fn select_upscale_videos(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<media::FileDetails>, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.dialog()
+        .file()
+        .set_title(text(
+            &state,
+            "Selecciona uno o varios vídeos",
+            "Select one or more videos",
+        ))
+        .add_filter(
+            text(&state, "Vídeos", "Videos"),
+            &extensions_without_dot(media::VIDEO_EXTENSIONS),
+        )
+        .pick_files(move |paths| {
+            let _ = tx.send(paths);
+        });
+    let picked = rx.recv().map_err(|e| e.to_string())?;
+    let mut details = Vec::new();
+    for file_path in picked.unwrap_or_default() {
+        let path = file_path.to_string();
+        if media::is_video(&path) && Path::new(&path).exists() {
+            if let Ok(file) = media::file_details(&path) {
+                details.push(file);
+            }
+        }
+    }
+    Ok(details)
+}
+
+/// Batch variant of `inspect_upscale_video` for drag & drop: returns the
+/// details of every supported video in `paths`, skipping the rest so one
+/// bad file does not reject the whole drop.
+#[tauri::command]
+async fn inspect_upscale_videos(
+    paths: Vec<String>,
+) -> Result<Vec<media::FileDetails>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut details = Vec::new();
+        for path in paths {
+            if !media::is_video(&path) || !Path::new(&path).exists() {
+                continue;
+            }
+            if let Ok(file) = media::file_details(&path) {
+                details.push(file);
+            }
+        }
+        Ok(details)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 async fn choose_upscale_folder(
     app: AppHandle,
@@ -879,6 +937,8 @@ fn main() {
             cancel_conversion,
             select_upscale_video,
             inspect_upscale_video,
+            select_upscale_videos,
+            inspect_upscale_videos,
             choose_upscale_folder,
             compute_upscale_plan,
             start_upscale,
